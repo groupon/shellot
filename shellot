@@ -1,0 +1,383 @@
+#!/usr/bin/env ruby
+
+# == License
+#
+# Copyright (c) 2013, Groupon, Inc.
+# All rights reserved.
+
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are
+# met:
+
+# Redistributions of source code must retain the above copyright notice,
+# this list of conditions and the following disclaimer.
+
+# Redistributions in binary form must reproduce the above copyright
+# notice, this list of conditions and the following disclaimer in the
+# documentation and/or other materials provided with the distribution.
+
+# Neither the name of GROUPON nor the names of its contributors may be
+# used to endorse or promote products derived from this software without
+# specific prior written permission.
+
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+# IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+# TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+# PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED
+# TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+# PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+# LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+# NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+CMD_HELP=%q{
+NAME
+    shellot - slim terminal realtime graphing tool
+
+SYNOPSIS
+    <bash command output> | ./shellot
+
+EXAMPLES
+    # For testing, randomly generate values weighted towards 0 and 1
+    # for separation and graph with shellot
+    for i in {1..10000}; do echo $[($RANDOM % 7)]; echo 0;\
+     echo 1; echo 1; sleep .001; done | ./shellot
+
+    # SSH to the target host, tail the httpd access log,
+    # filter the http status code (assuming $9 contains the code)
+    # using awk, and graph with shellot
+    ssh webserver.mydomain.com "tail -f /var/log/httpd/access_log"\
+     | awk '/ "GET \/index.html / {print $9;fflush();}'| ./shellot
+
+NOTES
+    When using scripts to pipe and filter the input for shellot,
+    ensure that lines are flushed quickly.
+    For example, in case of grep and awk:
+      grep --line-buffered
+      awk {print $0;fflush();}
+
+OPTIONS
+    -h, --help               display this help text and exit
+    -a, --average            show average instead of sum (needs
+                             key=value kind of input)
+    -t, --test               run tests
+
+}
+
+require 'thread'
+#require 'logger'
+#$logger = Logger.new('/tmp/shellot.log')
+
+require 'optparse'
+require 'curses'
+
+# Parse command line options
+options = {}
+options[:aggregation_type] = :SUM
+options[:test] = false
+OptionParser.new do |opts|
+  opts.on('-h', '--help', 'display this help text and exit') do
+    puts CMD_HELP
+    exit
+  end
+  opts.on('-a', '--average', "show average instead of sum") do
+    options[:aggregation_type] = :AVG
+  end
+  opts.on('-t', '--test', "run unit tests only") do
+    options[:test] = true
+  end
+  opts.parse!(ARGV)
+end
+
+class Shellot
+  LEGEND_HEIGHT = 10
+  Y_AXIS_WIDTH = 7
+  SHAPE_COLORS = [Curses::COLOR_BLUE, Curses::COLOR_GREEN,
+                   Curses::COLOR_RED, Curses::COLOR_YELLOW,
+                    Curses::COLOR_MAGENTA, Curses::COLOR_CYAN]
+  AVAILABLE_SHAPES = '*+&.%@'
+
+  def init_win_sizes
+    @master_win_width = Curses.cols
+    @master_win_height = Curses.lines
+    @graph_win_width = @master_win_width - Y_AXIS_WIDTH
+    @graph_win_height = @master_win_height - LEGEND_HEIGHT
+  end
+
+  def term_resized?
+    @master_win_width != Curses.cols or @master_win_height != Curses.lines
+  end
+
+  def init_windows
+    Curses.start_color() if @color_enabled
+    init_win_sizes
+    # window args are: (h, w, top, left)
+    # top=0, left=0 means start the window on the top left corner
+    @master_win = Curses::Window.new(@master_win_height,
+                       @master_win_width, 0, 0)
+    @graph_win = @master_win.subwin(@graph_win_height,
+                       @graph_win_width, 0, Y_AXIS_WIDTH)
+    @y_axis_win = @master_win.subwin(@graph_win_height,
+                       Y_AXIS_WIDTH, 0, 0)
+    @legend_win = @master_win.subwin(LEGEND_HEIGHT,
+                       @graph_win_width+Y_AXIS_WIDTH, @graph_win_height, 0)
+  end
+
+  def resize
+    init_windows
+    old_cols_size = @max_by_cols.size
+    if old_cols_size > @graph_win_width
+      #shrink @max_by_cols and @memory
+      to_cut = old_cols_size - @graph_win_width
+      @max_by_cols = @max_by_cols[to_cut..-1]
+      @memory.each_key do |key|
+        @memory[key] = @memory[key][to_cut..-1]
+      end
+    end
+    if old_cols_size < @graph_win_width
+      #expand @max_by_cols and @memory
+      @max_by_cols = [nil]*(@graph_win_width-old_cols_size) + @max_by_cols
+      @memory.each_key do |key|
+        @memory[key] = [nil]*(@graph_win_width-old_cols_size) + @memory[key]
+      end
+    end
+
+  end
+
+  def initialize
+    @color_enabled = Curses.has_colors?
+    init_windows
+    @memory = {}
+    @shape_ids = {}
+    @shape_colors = {}
+    @shape_colors_counter = 1 # 0 is white
+    @semaphore = Mutex.new
+    @max_by_cols = Array.new(@graph_win_width)
+    @max_value = 0
+    @aggregation_type = :SUM
+  end
+
+  def aggregation_type=(value)
+    @aggregation_type = value
+  end
+
+  def find_max_y
+    round_up(@max_value.to_i)
+  end
+
+  def update_max_value(values)
+    max_on_values = values.values.max
+    @max_by_cols = @max_by_cols[1..-1]+[max_on_values]
+    @max_value = @max_by_cols.max_by{|v| v.to_f} # nil.to_f is 0.0
+  end
+
+  def update_memory(values)
+    all_keys = @memory.keys | values.keys
+    all_keys.each do |key|
+      if values.has_key?(key)
+        @memory[key] ||= Array.new(@graph_win_width)
+        @memory[key] = @memory[key][1..-1] + [values[key]]
+      else
+        @memory[key] = @memory[key][1..-1] + [nil]
+      end
+    end
+    @memory.delete_if {|key, values| values.uniq==[nil]}
+  end
+
+  def shape_from_id(id)
+    index = id%AVAILABLE_SHAPES.size
+    AVAILABLE_SHAPES[index..index] # x..x is compatible with Ruby 1.8
+  end
+
+  def update_shapes
+    next_shape = @shape_ids.empty? ? 0 : (@shape_ids.values.max_by{|v| v})+1
+    @memory.each_key do |key|
+      @shape_ids[key] = next_shape unless @shape_ids.has_key?(key)
+      next_shape += 1
+    end
+  end
+
+  def update_colors
+    @memory.each_key do |key|
+      if @shape_colors[key].nil?
+        rand_color = SHAPE_COLORS[@shape_colors_counter%SHAPE_COLORS.size]
+        @shape_colors[key] = @shape_colors_counter
+        Curses.init_pair(@shape_colors_counter, rand_color, Curses::COLOR_BLACK)
+        @shape_colors_counter += 1
+      end
+    end
+  end
+
+  def plot_y_axis
+    max_y = find_max_y
+    @y_axis_win.box(?|, ?-)
+    # top
+    @y_axis_win.setpos(1,1)
+    @y_axis_win << max_y.to_s
+    # middle
+    @y_axis_win.setpos((@graph_win_height-1)/2,1)
+    @y_axis_win << (max_y.to_f / 2).to_s
+    # bottom
+    @y_axis_win.setpos(@graph_win_height-2,1)
+    @y_axis_win << '0'
+    @y_axis_win.refresh
+  end
+
+  def print_point(row_i,col_i,key)
+    @graph_win.setpos(row_i,col_i)
+    if @color_enabled
+      @graph_win.attron(Curses.color_pair(@shape_colors[key])) {
+        @graph_win << shape_from_id(@shape_ids[key])
+      }
+    else
+      @graph_win << @shape_ids[key].to_s
+    end
+  end
+
+  def plot_graph
+    max_y = find_max_y.to_f
+    factor = max_y==0 ? 1 : @graph_win_height/max_y
+    empty_row = ' '*@graph_win_width
+    key_on_point = Array.new(@graph_win_height){ {} }
+    @graph_win_width.times do |col_i|
+      @memory.each do |key, values|
+        unless values[col_i].nil?
+          normalized = @graph_win_height-values[col_i]*factor
+          key_on_point[normalized.ceil-1][col_i] = key
+        end
+      end
+    end
+    @graph_win_height.times do |row_i|
+      @graph_win.setpos(row_i,0)
+      @graph_win << empty_row.clone
+      key_on_point[row_i].each_key do |col_i|
+        key = key_on_point[row_i][col_i]
+        print_point(row_i,col_i,key)
+      end
+    end
+    @graph_win.refresh
+  end
+
+  def plot_legend
+    @legend_win.clear # in case one key shows off
+    @legend_win.setpos(1,1)
+    @legend_win << "shape\tcur val\tkey"
+    count=0
+    @memory.each do |key, values|
+      @legend_win.setpos(2+count,1)
+      cur_val = values.last
+      cur_val = cur_val.to_i if cur_val.to_i==cur_val
+      # sprintf float rounding is compatible with Ruby 1.8
+      cur_val = sprintf('%.5f',cur_val).to_f if cur_val.is_a?(Float)
+      if @color_enabled
+        @legend_win.attron(Curses.color_pair(@shape_colors[key])) {
+          @legend_win << "#{shape_from_id(@shape_ids[key])}\t#{cur_val}\t#{key}"
+        }
+      else
+        @legend_win << "#{@shape_ids[key]}\t#{key}\t\t\t#{cur_val}"
+      end
+      count+=1
+    end
+    @legend_win.box(?|, ?-)
+    @legend_win.refresh
+  end
+
+  def start_plotting_thread
+    Thread.new do
+      while true
+        sleep 1
+        resize if term_resized?
+        handle_plot_time
+      end
+    end
+  end
+
+  def handle_plot_time
+    old_values = nil
+    @semaphore.synchronize {
+      old_values = @values.clone
+      @count = 0
+      @values = Hash.new(0)
+    }
+    update_memory old_values
+    update_shapes
+    update_max_value old_values
+    update_colors
+    plot_y_axis
+    plot_graph
+    plot_legend
+  end
+
+  def run
+    start_plotting_thread
+    @count = 0
+    @values = Hash.new(0)
+    while line=gets
+      if @aggregation_type == :SUM
+        @semaphore.synchronize {
+          @values[line] += 1
+          @count += 1
+        }
+      elsif @aggregation_type == :AVG
+        parts = line.split('=')
+        raise "for average shellot needs a key=value kind of input" unless parts.size==2
+        event = parts[0]
+        events_count = parts[1].to_f
+        @semaphore.synchronize {
+          @values[event] = (@values[event]*@count + events_count)/(@count+1)
+          @count += 1
+        }
+      else
+        raise "unknown aggregation type"
+      end
+    end
+  end
+
+end
+
+# utility function
+def round_up(number)
+  n = number.to_i
+  return 5 if n<=5
+  return 10 if n<=10
+  return n if n.to_s[1..-1].to_i==0
+  # x..x is compatible with Ruby 1.8
+  ((n.to_s[0..0].to_i+1).to_s+("0"*(n.to_s.size-1))).to_i
+end
+
+if options[:test]
+  require "test/unit"
+  class ShellotTest < Test::Unit::TestCase
+    def test_simple
+      assert_equal(5, round_up(1))
+      assert_equal(5, round_up(4))
+      assert_equal(5, round_up(5))
+      assert_equal(10, round_up(6))
+      assert_equal(10, round_up(9))
+      assert_equal(10, round_up(10))
+      assert_equal(20, round_up(11))
+      assert_equal(20, round_up(20))
+      assert_equal(300, round_up(201))
+      assert_equal(300, round_up(299))
+      assert_equal(1000, round_up(901))
+      assert_equal(1000, round_up(999))
+      assert_equal(6000, round_up(5001))
+      assert_equal(6000, round_up(5670))
+    end
+  end
+else
+  shellot = Shellot.new
+  shellot.aggregation_type = options[:aggregation_type]
+  begin
+    Curses.init_screen()
+    shellot.run
+  rescue Interrupt
+    Curses.close_screen
+    puts "Bye"
+  rescue Exception => e
+    Curses.close_screen
+    puts "Error: #{e.message}"
+  end
+end
